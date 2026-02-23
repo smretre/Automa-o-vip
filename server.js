@@ -2,7 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const { Telegraf, Markup } = require("telegraf");
-const mercadopago = require("mercadopago");
+const { MercadoPagoConfig, Payment: MpPayment } = require("mercadopago");
 const cron = require("node-cron");
 
 const app = express();
@@ -10,9 +10,12 @@ app.use(express.json());
 
 const ADMIN_ID = Number(process.env.ADMIN_ID);
 
-mercadopago.configure({
-  access_token: process.env.MP_ACCESS_TOKEN
+// ✅ SDK NOVO
+const mpClient = new MercadoPagoConfig({
+  accessToken: process.env.MP_ACCESS_TOKEN
 });
+
+const paymentClient = new MpPayment(mpClient);
 
 // =============================
 // 🔌 MONGODB
@@ -66,6 +69,43 @@ const Settings = mongoose.model("Settings", settingsSchema);
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
 // =============================
+// 👑 PAINEL ADMIN (NOVO)
+// =============================
+bot.command("admin", async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID)
+    return ctx.reply("❌ Você não é administrador.");
+
+  ctx.reply(
+`⚙️ Painel Administrador ⚙️
+
+Status: O bot está pronto para venda ✅
+
+Olá, ${ctx.from.first_name}!
+Aqui, você pode fazer todas as configurações do seu bot, desde a gestão de grupos e planos até a personalização de mensagens e opções de pagamento.
+Transforme a experiência dos seus usuários e alcance novos patamares de eficiência e sucesso!
+
+💡 Você pode voltar para esse menu a qualquer momento digitando /admin.`,
+    Markup.inlineKeyboard([
+      [Markup.button.callback("💳 Gateways de pagamento", "ADMIN_GATEWAYS")],
+      [Markup.button.callback("💸 Métodos de pagamento", "ADMIN_METHODS")],
+      [Markup.button.callback("📦 Meus Produtos", "ADMIN_PRODUCTS")],
+      [Markup.button.callback("🏷 Meus Cupons", "ADMIN_COUPONS")],
+      [Markup.button.callback("⚙️ Configurações", "ADMIN_SETTINGS")],
+      [Markup.button.callback("❓ Ajuda e Suporte", "ADMIN_SUPPORT")]
+    ])
+  );
+});
+
+// Respostas temporárias (sem alterar sistema principal)
+bot.action(/ADMIN_/, async (ctx) => {
+  if (ctx.from.id !== ADMIN_ID)
+    return ctx.answerCbQuery("Não autorizado.");
+
+  await ctx.answerCbQuery();
+  await ctx.reply("⚙️ Função em desenvolvimento.");
+});
+
+// =============================
 // 🚀 START
 // =============================
 bot.start(async (ctx) => {
@@ -96,30 +136,32 @@ bot.start(async (ctx) => {
 // =============================
 async function createPixPayment(ctx, planType, amount, description) {
   const expiration = new Date();
-  expiration.setMinutes(expiration.getMinutes() + 30); // ⏳ 30 minutos limite
+  expiration.setMinutes(expiration.getMinutes() + 30);
 
-  const payment = await mercadopago.payment.create({
-    transaction_amount: Number(amount),
-    description,
-    payment_method_id: "pix",
-    date_of_expiration: expiration.toISOString(),
-    payer: {
-      email: `user${ctx.from.id}@vip.com`
-    },
-    metadata: {
-      telegramId: ctx.from.id,
-      planType
+  const payment = await paymentClient.create({
+    body: {
+      transaction_amount: Number(amount),
+      description,
+      payment_method_id: "pix",
+      date_of_expiration: expiration.toISOString(),
+      payer: {
+        email: `user${ctx.from.id}@vip.com`
+      },
+      metadata: {
+        telegramId: ctx.from.id,
+        planType
+      }
     }
   });
 
-  const qr = payment.body.point_of_interaction.transaction_data.qr_code_base64;
-  const pixCode = payment.body.point_of_interaction.transaction_data.qr_code;
+  const qr = payment.point_of_interaction.transaction_data.qr_code_base64;
+  const pixCode = payment.point_of_interaction.transaction_data.qr_code;
 
   await Payment.create({
     telegramId: ctx.from.id,
     planType,
     amount,
-    mpPaymentId: payment.body.id,
+    mpPaymentId: payment.id,
     expiresAt: expiration
   });
 
@@ -157,7 +199,7 @@ bot.action("BUY_LIFETIME", async (ctx) => {
 });
 
 // =============================
-// ✅ BOTÃO JÁ PAGUEI
+// ✅ JÁ PAGUEI
 // =============================
 bot.action("CHECK_PAYMENT", async (ctx) => {
   const payment = await Payment.findOne({
@@ -168,9 +210,11 @@ bot.action("CHECK_PAYMENT", async (ctx) => {
   if (!payment)
     return ctx.reply("❌ Nenhum pagamento pendente encontrado.");
 
-  const mpPayment = await mercadopago.payment.findById(payment.mpPaymentId);
+  const mpPayment = await paymentClient.get({
+    id: payment.mpPaymentId
+  });
 
-  if (mpPayment.body.status === "approved") {
+  if (mpPayment.status === "approved") {
     ctx.reply("✅ Pagamento confirmado automaticamente!");
   } else {
     ctx.reply("⏳ Pagamento ainda não foi identificado.");
@@ -184,12 +228,13 @@ app.post("/payment-webhook", async (req, res) => {
   if (req.body.type !== "payment") return res.sendStatus(200);
 
   const paymentId = req.body.data.id;
-  const mpPayment = await mercadopago.payment.findById(paymentId);
 
-  if (mpPayment.body.status !== "approved")
+  const mpPayment = await paymentClient.get({ id: paymentId });
+
+  if (mpPayment.status !== "approved")
     return res.sendStatus(200);
 
-  const { telegramId, planType } = mpPayment.body.metadata;
+  const { telegramId, planType } = mpPayment.metadata;
   const payment = await Payment.findOne({ mpPaymentId: paymentId });
 
   if (!payment || payment.status === "approved")
@@ -198,8 +243,7 @@ app.post("/payment-webhook", async (req, res) => {
   const settings = await Settings.findOne();
   const user = await User.findOne({ telegramId });
 
-  // 🔒 ANTI-FRAUDE
-  if (mpPayment.body.transaction_amount !== payment.amount)
+  if (mpPayment.transaction_amount !== payment.amount)
     return res.sendStatus(400);
 
   payment.status = "approved";
@@ -237,20 +281,16 @@ app.post("/payment-webhook", async (req, res) => {
 });
 
 // =============================
-// ⏰ CRON EXPIRAÇÃO + LIMPEZA PIX
-// =============================
 cron.schedule("*/10 * * * *", async () => {
   const now = new Date();
   const settings = await Settings.findOne();
   if (!settings) return;
 
-  // cancelar pagamentos expirados
   await Payment.deleteMany({
     status: "pending",
     expiresAt: { $lte: now }
   });
 
-  // remover usuários vencidos
   const expiredUsers = await User.find({
     status: "active",
     lifetime: false,
@@ -270,8 +310,6 @@ cron.schedule("*/10 * * * *", async () => {
   console.log("⏰ Verificação automática executada.");
 });
 
-// =============================
-// 🌍 WEBHOOK TELEGRAM
 // =============================
 app.use(bot.webhookCallback("/webhook"));
 
